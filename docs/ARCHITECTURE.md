@@ -167,6 +167,110 @@ blockbuster releases). Every component and data-flow connection is labelled.
 
 ---
 
+## Updated Architecture Diagram (Post-Roast Changes)
+
+The following diagram supersedes the diagram above. Two changes are highlighted with `[NEW]`:
+1. Per-user seat hold counter in Redis (Update 1 — closes seat-hoarding gap from Panel Q3)
+2. CloudWatch alarm on SQS queue depth + ECS worker cap + circuit breaker (Update 2 — Panel Q4)
+
+```
+                         USERS (500K RPS peak)
+                               │
+                               ▼
+         ┌─────────────────────────────────────────────────────┐
+         │              CloudFront CDN                          │
+         │  CACHE HIT (85%): static assets, event pages        │
+         │  CACHE MISS (15%): /api/*, auth, mutations          │
+         └──────────────────────────┬──────────────────────────┘
+                                    │ ~75K RPS to origin
+                                    ▼
+         ┌─────────────────────────────────────────────────────┐
+         │    Application Load Balancer (ALB)                   │
+         │    SSL termination │ health check: 10s interval      │
+         │    WAF rate limit: 1,000 req/s per IP                │
+         └──────────────────────────┬──────────────────────────┘
+                                    │ round-robin to healthy nodes
+                ┌───────────────────┼───────────────────┐
+                ▼                   ▼                   ▼
+        ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+        │ Node.js API  │   │ Node.js API  │   │ Node.js API  │
+        │  (auto-scale │   │  (auto-scale │   │  (auto-scale │
+        │   4–16 nodes)│   │   4–16 nodes)│   │   4–16 nodes)│
+        └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+               └──────────────────┼──────────────────┘
+                                  │
+          ┌───────────────────────┼─────────────────────────────┐
+          │                       │                             │
+          ▼                       ▼                             ▼
+┌──────────────────────┐  ┌───────────────────┐   ┌────────────────────────┐
+│    Redis Cluster     │  │ PostgreSQL Primary│   │  SQS Payment Queue     │
+│   (3 shards r6g.lg)  │  │  (writes only)    │   │                        │
+│                      │  │                   │   │ Visibility timeout:    │
+│ USE A — APP CACHE:   │  │ • INSERT bookings │   │ 300 seconds            │
+│  event:{id}:detail   │  │ • UPDATE seats    │   │ DLQ after 3 failures   │
+│  TTL=300s            │  │ • INSERT          │   │                        │
+│  event:{id}:seat_map │  │   booking_events  │   │ ← Async queue (see     │
+│  TTL=30s + DEL on    │  │                   │   │ QUEUE.md: 394 RPS      │
+│  booking confirmed   │  │         │         │   │ pool exhaustion limit) │
+│                      │  │         │ streams │   │                        │
+│ USE B — SEAT LOCKS:  │  │         ▼         │   │  [NEW] CloudWatch      │
+│  seat_lock:          │  │  Read Replicas ×2 │   │  Alarm: queue depth    │
+│  {evId}:{seatId}     │  │                   │   │  > 10,000 messages     │
+│  SETNX + TTL=600s    │  │  Handles:         │   │  → PagerDuty alert     │
+│                      │  │  • seat map reads │   │                        │
+│ [NEW] USE C —        │  │  • event listings │   └───────────┬────────────┘
+│  HOLD COUNTERS:      │  │  • booking history│               │
+│  holds:{uid}:{evId}  │  │                   │               │ SQS long-poll
+│  :count              │  └───────────────────┘               ▼
+│  Max: 8 holds/user   │                          ┌────────────────────────┐
+│  TTL=600s (matches   │                          │ Payment Worker (ECS)   │
+│  seat lock TTL)      │                          │                        │
+│                      │                          │ [NEW] Max tasks: 20    │
+│  Lua script atomics  │                          │ (was: unlimited)       │
+│  lock + counter INCR │                          │                        │
+│  in one round-trip   │                          │ [NEW] Circuit breaker: │
+│  (Panel Q3 fix)      │                          │ > 50 gateway failures  │
+└──────────────────────┘                          │ in 60s → OPEN state   │
+                                                  │ → stop pulling SQS     │
+                                                  │ → alarm on-call        │
+                                                  │ → retry after 60s      │
+                                                  │                        │
+                                                  │ Normal flow:           │
+                                                  │ 1. Read SQS msg        │
+                                                  │ 2. Check lockExpiry    │
+                                                  │ 3. Call payment gw     │
+                                                  │    (idempotency key    │
+                                                  │     = bookingId UUID)  │
+                                                  │ 4. UPDATE DB (primary) │
+                                                  │ 5. DECR holds counter  │
+                                                  │    [NEW]               │
+                                                  │ 6. DEL seat_lock       │
+                                                  │ 7. Publish SNS         │
+                                                  │ 8. Delete SQS msg      │
+                                                  └──────────┬─────────────┘
+                                                             │ SNS: booking-confirmed
+                                              ┌──────────────┴──────────────┐
+                                              ▼                             ▼
+                               ┌─────────────────────┐       ┌─────────────────────┐
+                               │   SES (Email)        │       │   SMS via SNS        │
+                               │   Booking confirmed, │       │   "Your seats for   │
+                               │   QR code, receipt   │       │   IPL Final: BMS-XX"│
+                               └─────────────────────┘       └─────────────────────┘
+```
+
+**Change summary:**
+- `[NEW] USE C` in Redis: per-user hold counter (`holds:{userId}:{eventId}:count`, max=8,
+  TTL=600s) — closes seat-hoarding gap identified in Panel Q3
+- `[NEW] CloudWatch Alarm` on SQS: queue depth > 10,000 → PagerDuty — missing from original
+  design, exposed by Panel Q4
+- `[NEW] ECS Max tasks: 20` — prevents runaway scaling during gateway outages (Panel Q4)
+- `[NEW] Circuit breaker` in Payment Worker — stops pulling SQS when gateway is failing,
+  decouples worker count from gateway health (Panel Q4)
+- `[NEW] Step 5: DECR holds counter` added to payment worker flow — keeps counter accurate
+  after booking completes
+
+---
+
 ## Component Annotations Index
 
 Every component below maps to a Part A design decision:
